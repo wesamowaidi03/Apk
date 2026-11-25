@@ -10,13 +10,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Unzip source
         run: unzip -o RingBot-QA-source.zip
-      - name: Calibrate colors and high-speed precision from gameplay
+      - name: Apply final precision fix
         run: |
           cat << 'EOF' > RingBotQA/app/src/main/java/com/ringbot/qa/Detector.java
           package com.ringbot.qa;
           import java.nio.ByteBuffer;
           final class Detector {
-           static final int N=1440; static final double STEP=360.0/N;
+           static final int N=1080; static final double STEP=360.0/N;
            static final double[] COS=new double[N],SIN=new double[N];
            static{for(int i=0;i<N;i++){COS[i]=Math.cos(i*Math.PI*2/N);SIN[i]=Math.sin(i*Math.PI*2/N);}}
            static double wrap(double a){return ((a+180)%360+360)%360-180;}
@@ -24,36 +24,31 @@ jobs:
            static Result scan(ByteBuffer b,int w,int h,int row,int pixel,double cy,double radius){
             Result out=new Result();int[] shaft=new int[N],zone=new int[N];
             double cx=w*.5,yy=h*cy,rr=w*radius;
-            double[] inner={.634,.706,.778,.85,.908},outer={1.015,1.055,1.095};
+            double[] inner={.634,.706,.778,.85,.908},outer={.994,1.037,1.08};
             for(int i=0;i<N;i++){
              for(double r:inner){int c=color(b,w,h,row,pixel,cx,yy,rr*r,i);if(Math.max((c>>16)&255,Math.max((c>>8)&255,c&255))<85)shaft[i]++;}
-             for(double r:outer){
-              int c=color(b,w,h,row,pixel,cx,yy,rr*r,i);
-              int red=(c>>16)&255,g=(c>>8)&255,bl=c&255;
-              if(g>135&&(red+g+bl)>460&&Math.min(red,Math.min(g,bl))>105)zone[i]++;
-             }
+             for(double r:outer){int c=color(b,w,h,row,pixel,cx,yy,rr*r,i);int red=(c>>16)&255,g=(c>>8)&255,bl=c&255;if(red>170&&g>165&&bl>135&&red-bl>1&&g-bl>0&&Math.abs(red-g)<35)zone[i]++;}
             }
-            int peak=0;int[] win=new int[N];
-            for(int i=0;i<N;i++){int v=0;for(int d=-10;d<=10;d++)v+=shaft[(i+d+N)%N];win[i]=v;if(v>peak)peak=v;}
-            if(peak<40)return out;
+            int best=-1,peak=0;
+            for(int i=0;i<N;i++){int v=0;for(int d=-7;d<=7;d++)v+=shaft[(i+d+N)%N];if(v>peak){peak=v;best=i;}}
+            if(peak<30)return out;
             double nx=0,ny=0;
-            for(int i=0;i<N;i++){if(win[i]==peak){nx+=COS[i];ny+=SIN[i];}}
+            for(int d=-12;d<=12;d++){int idx=(best+d+N)%N;int wgt=shaft[idx];if(wgt>0){nx+=COS[idx]*wgt;ny+=SIN[idx]*wgt;}}
             out.valid=true;out.angle=(Math.toDegrees(Math.atan2(ny,nx))+360)%360;
             double sx=0,sy=0;int count=0;
-            for(int i=0;i<N;i++){if(zone[i]>=2&&Math.abs(wrap(i*STEP-out.angle))>=6.5){sx+=COS[i];sy+=SIN[i];count++;}}
-            if(count<2){
-             sx=0;sy=0;count=0;
-             for(int i=0;i<N;i++){if(zone[i]>=1&&Math.abs(wrap(i*STEP-out.angle))>=6.5){sx+=COS[i];sy+=SIN[i];count++;}}
+            for(int i=0;i<N;i++){if(zone[i]>=2&&Math.abs(wrap(i*STEP-out.angle))>=7.5){sx+=COS[i];sy+=SIN[i];count++;}}
+            if(count>=2&&count<=105&&Math.hypot(sx,sy)/count>.95){
+             out.target=(Math.toDegrees(Math.atan2(sy,sx))+360)%360;
+             out.width=count*STEP;
+             out.targetValid=true;
+             return out;
             }
-            if(count>=2&&count<=140){
-             double approx=(Math.toDegrees(Math.atan2(sy,sx))+360)%360;
-             double csx=0,csy=0;int clean=0;
-             for(int i=0;i<N;i++){if(zone[i]>=1&&Math.abs(wrap(i*STEP-out.angle))>=6.5&&Math.abs(wrap(i*STEP-approx))<=22.0){csx+=COS[i];csy+=SIN[i];clean++;}}
-             if(clean>=2&&Math.hypot(csx,csy)/clean>.92){
-              out.target=(Math.toDegrees(Math.atan2(csy,csx))+360)%360;
-              out.width=clean*STEP;
-              out.targetValid=true;
-             }
+            sx=0;sy=0;count=0;
+            for(int i=0;i<N;i++){if(zone[i]>=1&&Math.abs(wrap(i*STEP-out.angle))>=7.5){sx+=COS[i];sy+=SIN[i];count++;}}
+            if(count>=3&&count<=105&&Math.hypot(sx,sy)/count>.96){
+             out.target=(Math.toDegrees(Math.atan2(sy,sx))+360)%360;
+             out.width=count*STEP;
+             out.targetValid=true;
             }
             return out;
            }
@@ -69,8 +64,10 @@ jobs:
           package com.ringbot.qa;
           import android.app.*;import android.content.*;import android.graphics.PixelFormat;import android.hardware.display.*;import android.media.*;import android.media.projection.*;import android.os.*;import android.util.DisplayMetrics;import android.view.WindowManager;
           public class CaptureService extends Service {
-           MediaProjection projection;VirtualDisplay display;ImageReader reader;HandlerThread worker;Handler handler;
-           String target;int w,h,sw,sh;double cy,r,delay,tx,ty,lastAngle,velocity,frameDt=0.025,goal=Double.NaN,goalWidth=5.0;
+           MediaProjection projection;VirtualDisplay display;ImageReader reader;
+           HandlerThread worker,tapWorker;Handler handler,tapHandler;
+           String target;int w,h,sw,sh;
+           double cy,r,delay,tx,ty,lastAngle,velocity,frameDt=0.025,goal=Double.NaN,goalWidth=5.0;
            long lastTime,lastTap,lastGoal;int samples;boolean armed=true;volatile boolean stopping;
            @Override public IBinder onBind(Intent i){return null;}
            @Override public int onStartCommand(Intent i,int flags,int id){
@@ -80,11 +77,12 @@ jobs:
              NotificationManager nm=getSystemService(NotificationManager.class);
              nm.createNotificationChannel(new NotificationChannel("qa","RingBot QA",NotificationManager.IMPORTANCE_LOW));
              PendingIntent stop=PendingIntent.getService(this,1,new Intent(this,CaptureService.class).setAction("STOP"),PendingIntent.FLAG_IMMUTABLE);
-             startForeground(9,new Notification.Builder(this,"qa").setContentTitle("RingBot QA running").setContentText("Calibrated precision mode • tap Stop to end").setSmallIcon(android.R.drawable.ic_media_pause).addAction(new Notification.Action.Builder(null,"Stop",stop).build()).setOngoing(true).build());
-             target=i.getStringExtra("pkg");cy=i.getDoubleExtra("y",.462);r=i.getDoubleExtra("r",.347);delay=i.getDoubleExtra("delay",62);tx=i.getDoubleExtra("tx",.5);ty=i.getDoubleExtra("ty",.62);
+             startForeground(9,new Notification.Builder(this,"qa").setContentTitle("RingBot QA running").setContentText("Precision mode • tap Stop to end").setSmallIcon(android.R.drawable.ic_media_pause).addAction(new Notification.Action.Builder(null,"Stop",stop).build()).setOngoing(true).build());
+             target=i.getStringExtra("pkg");cy=i.getDoubleExtra("y",.462);r=i.getDoubleExtra("r",.347);delay=i.getDoubleExtra("delay",52);tx=i.getDoubleExtra("tx",.5);ty=i.getDoubleExtra("ty",.62);
              DisplayMetrics m=new DisplayMetrics();getSystemService(WindowManager.class).getDefaultDisplay().getRealMetrics(m);
              sw=m.widthPixels;sh=m.heightPixels;w=Math.min(sw,720);h=Math.round(sh*(float)w/sw);
              worker=new HandlerThread("ring-analysis");worker.start();handler=new Handler(worker.getLooper());
+             tapWorker=new HandlerThread("tap-timer",android.os.Process.THREAD_PRIORITY_URGENT_AUDIO);tapWorker.start();tapHandler=new Handler(tapWorker.getLooper());
              projection=getSystemService(MediaProjectionManager.class).getMediaProjection(i.getIntExtra("result",0),(Intent)i.getParcelableExtra("data"));
              projection.registerCallback(new MediaProjection.Callback(){@Override public void onStop(){stopSelf();}},handler);
              reader=ImageReader.newInstance(w,h,PixelFormat.RGBA_8888,3);reader.setOnImageAvailableListener(this::frame,handler);
@@ -92,59 +90,66 @@ jobs:
              return START_NOT_STICKY;
             }catch(Exception e){stopSelf();return START_NOT_STICKY;}
            }
-           void reset(){if(handler!=null)handler.removeCallbacksAndMessages(null);lastTime=0;velocity=0;samples=0;goal=Double.NaN;armed=true;lastGoal=0;}
+           void reset(){if(tapHandler!=null)tapHandler.removeCallbacksAndMessages(null);lastTime=0;velocity=0;samples=0;goal=Double.NaN;armed=true;lastGoal=0;}
            void frame(ImageReader ir){
             if(stopping)return;
             try(Image im=ir.acquireLatestImage()){
              if(im==null)return;
              TapService tap=TapService.instance;
              if(tap==null||!tap.allowed(target)){reset();return;}
+             long captureTime=SystemClock.elapsedRealtimeNanos();
              Image.Plane p=im.getPlanes()[0];
              Detector.Result d=Detector.scan(p.getBuffer(),w,h,p.getRowStride(),p.getPixelStride(),cy,r);
              long now=SystemClock.elapsedRealtimeNanos();
-             if(!d.valid){if(now-lastTime>150_000_000L){lastTime=0;samples=0;}return;}
+             double scanMs=(now-captureTime)/1e6;
+             if(!d.valid){if(captureTime-lastTime>150_000_000L){lastTime=0;samples=0;}return;}
              if(lastTime!=0){
-              double dt=(now-lastTime)/1e9;
+              double dt=(captureTime-lastTime)/1e9;
               if(dt>.004&&dt<.20){
-               frameDt=0.7*frameDt+0.3*dt;
+               frameDt=0.75*frameDt+0.25*dt;
                double v=Detector.wrap(d.angle-lastAngle)/dt;
-               if(Math.abs(v)<3000){
+               if(Math.abs(v)<2000&&Math.abs(v)>5){
                 if(samples>0&&velocity*v<0){
-                 velocity=v;
-                 samples=1;
+                 velocity=v;samples=1;
                 }else{
-                 velocity=samples==0?v:.3*velocity+.75*v;
+                 velocity=samples==0?v:0.45*velocity+0.55*v;
                  samples++;
                 }
                }else samples=0;
               }else samples=0;
              }
-             lastAngle=d.angle;lastTime=now;
+             lastAngle=d.angle;lastTime=captureTime;
              if(d.targetValid){
-              if(Double.isNaN(goal)||Math.abs(Detector.wrap(d.target-goal))>5.0){
+              if(Double.isNaN(goal)||Math.abs(Detector.wrap(d.target-goal))>8.0){
                goal=d.target;goalWidth=d.width;armed=true;
-              }else if(Math.abs(Detector.wrap(d.angle-goal))>12.0){
-               goal=(goal+.25*Detector.wrap(d.target-goal)+360)%360;
-               goalWidth=.6*goalWidth+.4*d.width;
+              }else if(Math.abs(Detector.wrap(d.angle-goal))>16.0){
+               goal=(goal+0.25*Detector.wrap(d.target-goal)+360)%360;
+               goalWidth=0.6*goalWidth+0.4*d.width;
               }
               lastGoal=now;
              }
-             if(!armed||samples<1||Double.isNaN(goal)||now-lastGoal>750_000_000L||now-lastTap<130_000_000L||Math.abs(velocity)<15)return;
+             if(!armed&&!Double.isNaN(goal)&&now-lastTap>400_000_000L&&Math.abs(Detector.wrap(d.angle-goal))>35.0){
+              armed=true;
+             }
+             if(!armed||samples<3||Double.isNaN(goal)||now-lastGoal>800_000_000L||now-lastTap<150_000_000L||Math.abs(velocity)<15)return;
              double speed=Math.abs(velocity),dir=Math.signum(velocity);
-             double pred=d.angle+velocity*delay/1000.0;
+             double pred=d.angle+velocity*((delay+scanMs)/1000.0);
              double signedErr=Detector.wrap(goal-pred)*dir;
-             double halfWin=Math.max(1.2,goalWidth*0.42);
-             double maxLookahead=Math.max(halfWin,speed*Math.min(frameDt,0.045)*1.15);
+             double halfWin=Math.max(1.5,Math.min(4.0,goalWidth*0.5));
+             double maxWaitSec=Math.min(Math.max(frameDt,0.016),0.040)*1.25;
+             double maxLookahead=Math.max(halfWin,speed*maxWaitSec);
              if(signedErr>=-halfWin&&signedErr<=maxLookahead){
               long waitMs=signedErr>0?Math.round((signedErr/speed)*1000.0):0L;
-              armed=false;lastTap=now;
-              final float fx=(float)(tx*sw),fy=(float)(ty*sh);
-              if(waitMs<=1){tap.tap(target,fx,fy);}
-              else{handler.postDelayed(()->{if(!stopping&&TapService.instance!=null)TapService.instance.tap(target,fx,fy);},waitMs);}
+              if(waitMs<=45){
+               armed=false;lastTap=now+waitMs*1_000_000L;
+               final float fx=(float)(tx*sw),fy=(float)(ty*sh);
+               if(waitMs<=1){tap.tap(target,fx,fy);}
+               else{tapHandler.postDelayed(()->{if(!stopping&&TapService.instance!=null)TapService.instance.tap(target,fx,fy);},waitMs);}
+              }
              }
             }catch(Exception e){reset();}
            }
-           @Override public void onDestroy(){stopping=true;if(handler!=null)handler.removeCallbacksAndMessages(null);if(reader!=null)reader.setOnImageAvailableListener(null,null);if(display!=null)display.release();if(reader!=null)reader.close();if(projection!=null)projection.stop();if(worker!=null)worker.quitSafely();super.onDestroy();}
+           @Override public void onDestroy(){stopping=true;if(tapHandler!=null)tapHandler.removeCallbacksAndMessages(null);if(reader!=null)reader.setOnImageAvailableListener(null,null);if(display!=null)display.release();if(reader!=null)reader.close();if(projection!=null)projection.stop();if(worker!=null)worker.quitSafely();if(tapWorker!=null)tapWorker.quitSafely();super.onDestroy();}
           }
           EOF
           cat << 'EOF' > RingBotQA/app/src/main/java/com/ringbot/qa/MainActivity.java
@@ -155,7 +160,7 @@ jobs:
            EditText field(LinearLayout l,String title,String value){ TextView t=new TextView(this);t.setText(title);l.addView(t);EditText e=new EditText(this);e.setSingleLine();e.setText(value);l.addView(e);return e; }
            Button button(LinearLayout l,String s,Runnable f){Button b=new Button(this);b.setText(s);l.addView(b);b.setOnClickListener(v->f.run());return b;}
            @Override public void onCreate(Bundle b){super.onCreate(b);ScrollView sc=new ScrollView(this);LinearLayout l=new LinearLayout(this);l.setOrientation(1);l.setPadding(32,32,32,32);sc.addView(l);setContentView(sc); TextView intro=new TextView(this);intro.setText("RingBot QA — Enable test taps, enter your game's package, then capture the entire screen and open the game. Stop from the notification.");l.addView(intro);
-           pkg=field(l,"Game package name","");cy=field(l,"Ring center Y / screen height","0.462");rad=field(l,"Ring radius / screen width","0.347");lag=field(l,"Estimated capture + tap delay (ms)","62");tx=field(l,"Tap X / screen width","0.50");ty=field(l,"Tap Y / screen height","0.62");
+           pkg=field(l,"Game package name","io.playout");cy=field(l,"Ring center Y / screen height","0.462");rad=field(l,"Ring radius / screen width","0.347");lag=field(l,"Estimated capture + tap delay (ms)","52");tx=field(l,"Tap X / screen width","0.50");ty=field(l,"Tap Y / screen height","0.62");
            button(l,"Enable accessibility test taps",()->startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));button(l,"Start capture",()->{try{target=pkg.getText().toString().trim();if(target.isEmpty()||target.equals(getPackageName()))throw new Exception("Enter a valid game package name.");getPackageManager().getApplicationInfo(target,0); y=Double.parseDouble(cy.getText().toString());r=Double.parseDouble(rad.getText().toString());delay=Double.parseDouble(lag.getText().toString());tapX=Double.parseDouble(tx.getText().toString());tapY=Double.parseDouble(ty.getText().toString());if(!(y>.15&&y<.85&&r>.1&&r<.45&&delay>=0&&delay<=250&&tapX>0&&tapX<1&&tapY>0&&tapY<1))throw new Exception("Invalid calibration");if(TapService.instance==null)throw new Exception("Enable accessibility first");startActivityForResult(getSystemService(MediaProjectionManager.class).createScreenCaptureIntent(),1);}catch(android.content.pm.PackageManager.NameNotFoundException e){Toast.makeText(this,"Game package not installed: "+target,Toast.LENGTH_LONG).show();}catch(Exception e){Toast.makeText(this,e.getMessage()==null?"Check game package and inputs":e.getMessage(),Toast.LENGTH_LONG).show();}});
            button(l,"Stop",()->stopService(new Intent(this,CaptureService.class))); }
            @Override protected void onActivityResult(int q,int result,Intent data){super.onActivityResult(q,result,data);if(q==1&&result==RESULT_OK&&data!=null){Intent i=new Intent(this,CaptureService.class);i.putExtra("data",data);i.putExtra("result",result);i.putExtra("pkg",target);i.putExtra("y",y);i.putExtra("r",r);i.putExtra("delay",delay);i.putExtra("tx",tapX);i.putExtra("ty",tapY);startForegroundService(i);}}
@@ -171,7 +176,7 @@ jobs:
            @Override public void onInterrupt(){}
            @Override public void onDestroy(){instance=null;super.onDestroy();}
            boolean allowed(String target){try {AccessibilityNodeInfo root=getRootInActiveWindow();if(root==null)return false;CharSequence p=root.getPackageName();boolean match=target!=null&&target.contentEquals(p);root.recycle();return match;}catch(Exception e){return false;}}
-           boolean tap(String target,float x,float y){if(!allowed(target))return false;Path path=new Path();path.moveTo(x,y);return dispatchGesture(new GestureDescription.Builder().addStroke(new GestureDescription.StrokeDescription(path,0,6)).build(),null,null);}
+           boolean tap(String target,float x,float y){if(!allowed(target))return false;Path path=new Path();path.moveTo(x,y);return dispatchGesture(new GestureDescription.Builder().addStroke(new GestureDescription.StrokeDescription(path,0,8)).build(),null,null);}
           }
           EOF
       - name: Set up JDK 17
