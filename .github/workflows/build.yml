@@ -10,13 +10,13 @@ jobs:
       - uses: actions/checkout@v4
       - name: Unzip source
         run: unzip -o RingBot-QA-source.zip
-      - name: Upgrade detector and high-speed precision
+      - name: Fix target skipping and improve high-speed tracking
         run: |
           cat << 'EOF' > RingBotQA/app/src/main/java/com/ringbot/qa/Detector.java
           package com.ringbot.qa;
           import java.nio.ByteBuffer;
           final class Detector {
-           static final int N=1440; static final double STEP=360.0/N;
+           static final int N=900; static final double STEP=360.0/N;
            static final double[] COS=new double[N],SIN=new double[N];
            static{for(int i=0;i<N;i++){COS[i]=Math.cos(i*Math.PI*2/N);SIN[i]=Math.sin(i*Math.PI*2/N);}}
            static double wrap(double a){return ((a+180)%360+360)%360-180;}
@@ -30,14 +30,27 @@ jobs:
              for(double r:outer){int c=color(b,w,h,row,pixel,cx,yy,rr*r,i);int red=(c>>16)&255,g=(c>>8)&255,bl=c&255;if(red>165&&g>160&&bl>130&&red-bl>1&&g-bl>0&&Math.abs(red-g)<38)zone[i]++;}
             }
             int peak=0;int[] win=new int[N];
-            for(int i=0;i<N;i++){int v=0;for(int d=-10;d<=10;d++)v+=shaft[(i+d+N)%N];win[i]=v;if(v>peak)peak=v;}
-            if(peak<40)return out;
+            for(int i=0;i<N;i++){int v=0;for(int d=-6;d<=6;d++)v+=shaft[(i+d+N)%N];win[i]=v;if(v>peak)peak=v;}
+            if(peak<26)return out;
             double nx=0,ny=0;
             for(int i=0;i<N;i++){if(win[i]==peak){nx+=COS[i];ny+=SIN[i];}}
             out.valid=true;out.angle=(Math.toDegrees(Math.atan2(ny,nx))+360)%360;
             double sx=0,sy=0;int count=0;
-            for(int i=0;i<N;i++){if(zone[i]>=1&&Math.abs(wrap(i*STEP-out.angle))>=5.5){sx+=COS[i];sy+=SIN[i];count++;}}
-            if(count>=2&&count<=130&&Math.hypot(sx,sy)/count>.92){out.target=(Math.toDegrees(Math.atan2(sy,sx))+360)%360;out.width=count*STEP;out.targetValid=true;}
+            for(int i=0;i<N;i++){if(zone[i]>=2&&Math.abs(wrap(i*STEP-out.angle))>=6.0){sx+=COS[i];sy+=SIN[i];count++;}}
+            if(count<2){
+             sx=0;sy=0;count=0;
+             for(int i=0;i<N;i++){if(zone[i]>=1&&Math.abs(wrap(i*STEP-out.angle))>=6.0){sx+=COS[i];sy+=SIN[i];count++;}}
+            }
+            if(count>=2&&count<=90){
+             double center=(Math.toDegrees(Math.atan2(sy,sx))+360)%360;
+             double csx=0,csy=0;int clean=0;
+             for(int i=0;i<N;i++){if(zone[i]>=1&&Math.abs(wrap(i*STEP-out.angle))>=6.0&&Math.abs(wrap(i*STEP-center))<=25.0){csx+=COS[i];csy+=SIN[i];clean++;}}
+             if(clean>=2&&Math.hypot(csx,csy)/clean>.90){
+              out.target=(Math.toDegrees(Math.atan2(csy,csx))+360)%360;
+              out.width=clean*STEP;
+              out.targetValid=true;
+             }
+            }
             return out;
            }
            static int color(ByteBuffer b,int w,int h,int row,int pix,double cx,double cy,double r,int i){
@@ -54,7 +67,7 @@ jobs:
           public class CaptureService extends Service {
            MediaProjection projection;VirtualDisplay display;ImageReader reader;HandlerThread worker;Handler handler;
            String target;int w,h,sw,sh;double cy,r,delay,tx,ty,lastAngle,velocity,goal=Double.NaN,goalWidth=6.0;
-           long lastTime,lastTap,lastGoal;int samples;boolean armed=true;volatile boolean stopping;
+           long lastTime,lastTap,lastGoal;int samples;boolean armed=true,reversed=false;volatile boolean stopping;
            @Override public IBinder onBind(Intent i){return null;}
            @Override public int onStartCommand(Intent i,int flags,int id){
             if(i==null||"STOP".equals(i.getAction())){stopSelf();return START_NOT_STICKY;}
@@ -75,7 +88,7 @@ jobs:
              return START_NOT_STICKY;
             }catch(Exception e){stopSelf();return START_NOT_STICKY;}
            }
-           void reset(){lastTime=0;velocity=0;samples=0;goal=Double.NaN;armed=true;lastGoal=0;}
+           void reset(){if(handler!=null)handler.removeCallbacksAndMessages(null);lastTime=0;velocity=0;samples=0;goal=Double.NaN;armed=true;reversed=false;lastGoal=0;}
            void frame(ImageReader ir){
             if(stopping)return;
             try(Image im=ir.acquireLatestImage()){
@@ -85,29 +98,39 @@ jobs:
              Image.Plane p=im.getPlanes()[0];
              Detector.Result d=Detector.scan(p.getBuffer(),w,h,p.getRowStride(),p.getPixelStride(),cy,r);
              long now=SystemClock.elapsedRealtimeNanos();
-             if(!d.valid){if(now-lastTime>150_000_000L){lastTime=0;samples=0;}return;}
+             if(!d.valid){if(now-lastTime>180_000_000L){lastTime=0;samples=0;}return;}
              if(lastTime!=0){
               double dt=(now-lastTime)/1e9;
-              if(dt>.004&&dt<.20){
+              if(dt>.004&&dt<.22){
                double v=Detector.wrap(d.angle-lastAngle)/dt;
                if(Math.abs(v)<3600){
-                if(samples>0&&velocity*v<0){velocity=v;samples=1;}
-                else{velocity=samples==0?v:.25*velocity+.75*v;samples++;}
+                if(samples>0&&velocity*v<0){
+                 double mag=Math.max(Math.abs(v),Math.abs(velocity)*0.85);
+                 velocity=Math.signum(v)*mag;
+                 samples=1;
+                 reversed=true;
+                 if(!armed&&now-lastTap>105_000_000L)armed=true;
+                }else{
+                 velocity=samples==0?v:.25*velocity+.75*v;
+                 samples++;
+                 reversed=false;
+                }
                }else samples=0;
               }else samples=0;
              }
              lastAngle=d.angle;lastTime=now;
              if(d.targetValid){
-              if(Double.isNaN(goal)||Math.abs(Detector.wrap(d.target-goal))>8.0){goal=d.target;goalWidth=d.width;armed=true;}
-              else if(Math.abs(Detector.wrap(d.angle-goal))>10.0){goal=(goal+.35*Detector.wrap(d.target-goal)+360)%360;goalWidth=.5*goalWidth+.5*d.width;}
+              if(Double.isNaN(goal)||Math.abs(Detector.wrap(d.target-goal))>4.5){goal=d.target;goalWidth=d.width;armed=true;}
+              else if(Math.abs(Detector.wrap(d.angle-goal))>8.0){goal=(goal+.35*Detector.wrap(d.target-goal)+360)%360;goalWidth=.5*goalWidth+.5*d.width;}
               lastGoal=now;
              }
-             if(!armed||samples<2||Double.isNaN(goal)||now-lastGoal>800_000_000L||now-lastTap<140_000_000L||Math.abs(velocity)<15)return;
+             int minSamples=reversed?1:2;
+             if(!armed||samples<minSamples||Double.isNaN(goal)||now-lastGoal>900_000_000L||now-lastTap<105_000_000L||Math.abs(velocity)<15)return;
              double speed=Math.abs(velocity),dir=Math.signum(velocity);
              double pred=d.angle+velocity*delay/1000.0;
              double signedErr=Detector.wrap(goal-pred)*dir;
-             double halfWin=Math.max(0.8,goalWidth*0.45);
-             double lookahead=speed*0.024;
+             double halfWin=Math.max(2.5,goalWidth*0.65);
+             double lookahead=Math.max(12.0,speed*0.085);
              if(signedErr>=-halfWin&&signedErr<=lookahead){
               long waitMs=signedErr>0?Math.round((signedErr/speed)*1000.0):0L;
               armed=false;lastTap=now;
