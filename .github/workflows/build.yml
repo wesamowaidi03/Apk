@@ -10,6 +10,35 @@ jobs:
       - uses: actions/checkout@v4
       - name: Unzip source
         run: unzip -o RingBot-QA-source.zip
+      - name: Remove debuggable restriction
+        run: |
+          cat << 'EOF' > RingBotQA/app/src/main/java/com/ringbot/qa/MainActivity.java
+          package com.ringbot.qa;
+          import android.app.*; import android.os.*; import android.content.*; import android.media.projection.MediaProjectionManager; import android.provider.Settings; import android.widget.*;
+          public class MainActivity extends Activity {
+           EditText pkg,cy,rad,lag,tx,ty; String target; double y,r,delay,tapX,tapY;
+           EditText field(LinearLayout l,String title,String value){ TextView t=new TextView(this);t.setText(title);l.addView(t);EditText e=new EditText(this);e.setSingleLine();e.setText(value);l.addView(e);return e; }
+           Button button(LinearLayout l,String s,Runnable f){Button b=new Button(this);b.setText(s);l.addView(b);b.setOnClickListener(v->f.run());return b;}
+           @Override public void onCreate(Bundle b){super.onCreate(b);ScrollView sc=new ScrollView(this);LinearLayout l=new LinearLayout(this);l.setOrientation(1);l.setPadding(32,32,32,32);sc.addView(l);setContentView(sc); TextView intro=new TextView(this);intro.setText("RingBot QA — Enable test taps, enter your game's package, then capture the entire screen and open the game. Stop from the notification.");l.addView(intro);
+           pkg=field(l,"Game package name","");cy=field(l,"Ring center Y / screen height","0.462");rad=field(l,"Ring radius / screen width","0.347");lag=field(l,"Estimated capture + tap delay (ms)","45");tx=field(l,"Tap X / screen width","0.50");ty=field(l,"Tap Y / screen height","0.62");
+           button(l,"Enable accessibility test taps",()->startActivity(new Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)));button(l,"Start capture",()->{try{target=pkg.getText().toString().trim();if(target.isEmpty()||target.equals(getPackageName()))throw new Exception("Enter a valid game package name.");getPackageManager().getApplicationInfo(target,0); y=Double.parseDouble(cy.getText().toString());r=Double.parseDouble(rad.getText().toString());delay=Double.parseDouble(lag.getText().toString());tapX=Double.parseDouble(tx.getText().toString());tapY=Double.parseDouble(ty.getText().toString());if(!(y>.15&&y<.85&&r>.1&&r<.45&&delay>=0&&delay<=150&&tapX>0&&tapX<1&&tapY>0&&tapY<1))throw new Exception("Invalid calibration");if(TapService.instance==null)throw new Exception("Enable accessibility first");startActivityForResult(getSystemService(MediaProjectionManager.class).createScreenCaptureIntent(),1);}catch(android.content.pm.PackageManager.NameNotFoundException e){Toast.makeText(this,"Game package not installed: "+target,Toast.LENGTH_LONG).show();}catch(Exception e){Toast.makeText(this,e.getMessage()==null?"Check game package and inputs":e.getMessage(),Toast.LENGTH_LONG).show();}});
+           button(l,"Stop",()->stopService(new Intent(this,CaptureService.class))); }
+           @Override protected void onActivityResult(int q,int result,Intent data){super.onActivityResult(q,result,data);if(q==1&&result==RESULT_OK&&data!=null){Intent i=new Intent(this,CaptureService.class);i.putExtra("data",data);i.putExtra("result",result);i.putExtra("pkg",target);i.putExtra("y",y);i.putExtra("r",r);i.putExtra("delay",delay);i.putExtra("tx",tapX);i.putExtra("ty",tapY);startForegroundService(i);}}
+          }
+          EOF
+          cat << 'EOF' > RingBotQA/app/src/main/java/com/ringbot/qa/TapService.java
+          package com.ringbot.qa;
+          import android.accessibilityservice.*; import android.graphics.Path; import android.view.accessibility.*;
+          public class TapService extends AccessibilityService {
+           static volatile TapService instance;
+           @Override public void onServiceConnected(){instance=this;}
+           @Override public void onAccessibilityEvent(AccessibilityEvent e){}
+           @Override public void onInterrupt(){}
+           @Override public void onDestroy(){instance=null;super.onDestroy();}
+           boolean allowed(String target){try {AccessibilityNodeInfo root=getRootInActiveWindow();if(root==null)return false;CharSequence p=root.getPackageName();boolean match=target!=null&&target.contentEquals(p);root.recycle();return match;}catch(Exception e){return false;}}
+           boolean tap(String target,float x,float y){if(!allowed(target))return false;Path path=new Path();path.moveTo(x,y);return dispatchGesture(new GestureDescription.Builder().addStroke(new GestureDescription.StrokeDescription(path,0,12)).build(),null,null);}
+          }
+          EOF
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
@@ -27,3 +56,4 @@ jobs:
         with:
           name: RingBotQA-APK
           path: RingBotQA/app/build/outputs/apk/debug/*.apk
+          
